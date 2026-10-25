@@ -6,6 +6,9 @@ Remove duplicate photos (by content) from nested folders.
 - Nothing is deleted: duplicates are MOVED to a separate folder,
     preserving the folder structure and original filenames.
 - Runs in dry-run mode by default. Add --apply to move files for real.
+- Any folder or file that cannot be read is REPORTED (stderr, summary and
+    dedupe_errors.csv). If the scan was incomplete, --apply is refused unless
+    --allow-incomplete is given. Exit code is non-zero when errors occurred.
 
 Examples:
     python dedupe_photos.py "D:\\Photos"                 # only shows what it would do
@@ -32,6 +35,27 @@ MEDIA_EXT = {
 COPY_PATTERN = re.compile(r"(\(\d+\)|\bcopy\b|\bcopies\b|_copy|- copy)", re.IGNORECASE)
 
 
+def record_error(errors: list, stage: str, path, exc: Exception) -> None:
+    """Remember an error and print it immediately."""
+    reason = getattr(exc, "strerror", None) or str(exc)
+    errors.append((stage, str(path), reason))
+    print(f"\n! [{stage}] {path}: {reason}", file=sys.stderr)
+
+
+def write_error_report(errors: list, report_path: str) -> None:
+    if not errors:
+        # Do not leave a stale error report from a previous run.
+        try:
+            os.remove(report_path)
+        except OSError:
+            pass
+        return
+    with open(report_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["STAGE", "PATH", "REASON"])
+        w.writerows(errors)
+
+
 def sha256(path: Path, limit: int | None = None) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -43,12 +67,17 @@ def sha256(path: Path, limit: int | None = None) -> str:
     return h.hexdigest()
 
 
-def scan(root: Path, skip_dir: Path, all_files: bool):
+def scan(root: Path, skip_dir: Path, all_files: bool, errors: list):
     files = []
-    for dirpath, dirnames, filenames in os.walk(root):
+
+    def on_walk_error(exc: OSError):
+        # Called by os.walk when a directory cannot be listed (permissions, I/O error...).
+        record_error(errors, "scan: directory not readable", exc.filename or root, exc)
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_walk_error):
         current = Path(dirpath)
         # Skip the duplicates folder if it is inside root.
-        dirnames[:] = [d for d in dirnames if (current / d).resolve() != skip_dir.resolve()]
+        dirnames[:] = [d for d in dirnames if (current / d) != skip_dir]
         for name in filenames:
             p = current / name
             if not all_files and p.suffix.lower() not in MEDIA_EXT:
@@ -56,20 +85,21 @@ def scan(root: Path, skip_dir: Path, all_files: bool):
             try:
                 if p.is_symlink():
                     continue
-                files.append(p)
-            except OSError:
+            except OSError as e:
+                record_error(errors, "scan: file check failed", p, e)
                 continue
+            files.append(p)
     return files
 
 
-def find_duplicates(files):
+def find_duplicates(files, errors: list):
     # 1) By size.
     by_size = defaultdict(list)
     for p in files:
         try:
             by_size[p.stat().st_size].append(p)
         except OSError as e:
-            print(f"! Cannot read {p}: {e}", file=sys.stderr)
+            record_error(errors, "stat", p, e)
 
     candidates = [g for size, g in by_size.items() if len(g) > 1 and size > 0]
 
@@ -83,7 +113,7 @@ def find_duplicates(files):
             try:
                 by_quick[sha256(p, 65536)].append(p)
             except OSError as e:
-                print(f"! Error processing {p}: {e}", file=sys.stderr)
+                record_error(errors, "hash", p, e)
         for qg in by_quick.values():
             if len(qg) < 2:
                 continue
@@ -92,7 +122,7 @@ def find_duplicates(files):
                 try:
                     by_full[sha256(p)].append(p)
                 except OSError as e:
-                    print(f"! Error processing {p}: {e}", file=sys.stderr)
+                    record_error(errors, "hash", p, e)
             groups.extend(fg for fg in by_full.values() if len(fg) > 1)
         done += len(g)
         print(f"\r  candidates checked: {done}/{total}", end="", file=sys.stderr)
@@ -128,9 +158,13 @@ def unique_dest(dest: Path) -> Path:
         i += 1
 
 
-def remove_empty_dirs(root: Path):
+def remove_empty_dirs(root: Path, errors: list):
     removed = 0
-    for dirpath, _, _ in os.walk(root, topdown=False):
+
+    def on_walk_error(exc: OSError):
+        record_error(errors, "remove-empty: directory not readable", exc.filename or root, exc)
+
+    for dirpath, _, _ in os.walk(root, topdown=False, onerror=on_walk_error):
         p = Path(dirpath)
         if p == root:
             continue
@@ -138,8 +172,8 @@ def remove_empty_dirs(root: Path):
             if not any(p.iterdir()):
                 p.rmdir()
                 removed += 1
-        except OSError:
-            pass
+        except OSError as e:
+            record_error(errors, "remove-empty", p, e)
     return removed
 
 
@@ -150,7 +184,10 @@ def main():
     ap.add_argument("--apply", action="store_true", help="Actually move files (otherwise, run in dry-run mode)")
     ap.add_argument("--all-files", action="store_true", help="Check all files, not just photos and videos")
     ap.add_argument("--remove-empty", action="store_true", help="Remove folders left empty after moving files")
+    ap.add_argument("--allow-incomplete", action="store_true",
+                    help="Allow --apply even if some folders/files could not be read")
     ap.add_argument("--report", default="dedupe_report.csv", help="Name of the CSV report")
+    ap.add_argument("--error-report", default="dedupe_errors.csv", help="Name of the CSV error report")
     args = ap.parse_args()
 
     root = Path(args.root).expanduser().resolve()
@@ -159,16 +196,21 @@ def main():
 
     dup_dir = Path(args.dup_dir).expanduser().resolve() if args.dup_dir else root.with_name(root.name + "_duplicates")
 
+    errors: list = []
+
     print(f"Scanning: {root}")
-    files = scan(root, dup_dir, args.all_files)
+    files = scan(root, dup_dir, args.all_files, errors)
     print(f"  files found: {len(files)}")
+    if errors:
+        print(f"  WARNING: {len(errors)} problem(s) during scan - the file list may be incomplete.",
+              file=sys.stderr)
 
     folder_counts = defaultdict(int)
     for p in files:
         folder_counts[p.parent] += 1
 
     print("Finding duplicates...")
-    groups = find_duplicates(files)
+    groups = find_duplicates(files, errors)
 
     rows = []
     to_move = []
@@ -178,7 +220,11 @@ def main():
         for p in g:
             if p == keeper:
                 continue
-            size = p.stat().st_size
+            try:
+                size = p.stat().st_size
+            except OSError as e:
+                record_error(errors, "stat", p, e)
+                continue
             saved += size
             to_move.append(p)
             rows.append([str(keeper), str(p), size])
@@ -193,25 +239,46 @@ def main():
         w.writerows(rows)
     print(f"Report: {os.path.abspath(args.report)}")
 
+    # Refuse to modify anything based on an incomplete scan.
+    if errors and args.apply and not args.allow_incomplete:
+        write_error_report(errors, args.error_report)
+        print(f"\nABORTED: {len(errors)} folder(s)/file(s) could not be read, so the scan is incomplete.",
+              file=sys.stderr)
+        print(f"Details: {os.path.abspath(args.error_report)}", file=sys.stderr)
+        print("Fix the permissions and re-run, or use --allow-incomplete to move anyway.", file=sys.stderr)
+        sys.exit(2)
+
     if not args.apply:
+        write_error_report(errors, args.error_report)
+        if errors:
+            print(f"\nDry-run finished WITH {len(errors)} ERROR(S): the results above are incomplete.",
+                  file=sys.stderr)
+            print(f"Details: {os.path.abspath(args.error_report)}", file=sys.stderr)
+            sys.exit(2)
         print("\nDry-run mode - nothing was changed. Review the report and run with --apply.")
         return
 
     moved = 0
     for p in to_move:
         dest = unique_dest(dup_dir / p.relative_to(root))
-        dest.parent.mkdir(parents=True, exist_ok=True)
         try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(p), str(dest))
             moved += 1
         except OSError as e:
-            print(f"! Failed to move {p}: {e}", file=sys.stderr)
+            record_error(errors, "move", p, e)
 
     print(f"\nFiles moved: {moved} -> {dup_dir}")
 
     if args.remove_empty:
-        n = remove_empty_dirs(root)
+        n = remove_empty_dirs(root, errors)
         print(f"Empty folders removed: {n}")
+
+    write_error_report(errors, args.error_report)
+    if errors:
+        print(f"\nFinished WITH {len(errors)} ERROR(S). Details: {os.path.abspath(args.error_report)}",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

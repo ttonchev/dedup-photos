@@ -12,6 +12,8 @@ It is built for the "years of photos merged from several computers" situation: d
 - CSV report showing which copy was kept and which were moved
 - Original names and folder grouping of the kept files are left untouched
 - Fast: files are compared by size first, then a partial hash, and only then a full hash
+- Reports every folder or file it could not read (permissions, I/O errors) instead of silently skipping it
+- Refuses to move anything if the scan was incomplete, unless you explicitly allow it
 - No external dependencies
 
 ## Requirements
@@ -49,13 +51,15 @@ Duplicates are moved to `D:\Photos_duplicates`, preserving their relative paths.
 | `--remove-empty` | After moving, delete folders left empty in the photos folder. |
 | `--all-files` | Check every file type, not just photos and videos. |
 | `--report NAME` | Name of the CSV report (default: `dedupe_report.csv`). |
+| `--allow-incomplete` | Allow `--apply` even if some folders or files could not be read. |
+| `--error-report NAME` | Name of the CSV error report (default: `dedupe_errors.csv`). |
 
 ## Which copy is kept?
 
 For each group of identical files, the script keeps one using these rules, in order:
 
 1. The file located in the folder containing the most media files (most likely a real album)
-2. A file whose name does not look like a copy (`(1)`, `copy`, `copies`, ...)
+2. A file whose name does not look like a copy (`(1)`, `copy`, `копие`, ...)
 3. The shorter file name
 4. The oldest modification date
 5. Alphabetical path, as a final tie-breaker
@@ -80,6 +84,18 @@ Use `--all-files` to include everything else.
 | DUPLICATE | Path of the file that is (or would be) moved |
 | SIZE (bytes) | Size of the duplicate |
 
+## Error handling
+
+If a folder cannot be listed or a file cannot be read or hashed, the script:
+
+- prints the path and reason to stderr as soon as it happens
+- shows a warning in the summary that the results may be incomplete
+- writes all problems to `dedupe_errors.csv` (`STAGE;PATH;REASON`)
+- exits with a non-zero code (`2` for scan/hash problems, `1` if moving or cleanup failed)
+- **refuses `--apply`** when the scan is incomplete, so nothing is moved based on partial results. Fix the permissions and re-run, or pass `--allow-incomplete` if you accept the risk.
+
+A stale `dedupe_errors.csv` from a previous run is removed when a run finishes without errors.
+
 ## Limitations
 
 - Only **exact** duplicates are found. Resized, re-compressed, cropped or edited versions of a photo are different files and are not detected.
@@ -88,7 +104,7 @@ Use `--all-files` to include everything else.
 
 ## Recommended workflow
 
-1. Back up the photos folder.
+1. Back up the photos folder (always a good idea before bulk operations).
 2. Run a dry run and skim `dedupe_report.csv`.
 3. Run with `--apply`.
 4. Browse your library and the `_duplicates` folder to confirm everything looks right.
